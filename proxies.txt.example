@@ -1,0 +1,15 @@
+# HTTP/HTTPS proxies
+http://123.45.67.89:8080
+http://username:password@proxy.example.com:3128
+
+# SOCKS5 proxies (requires aiohttp-socks)
+socks5://98.76.54.32:1080
+socks5://user:pass@socks-proxy.example.com:9050
+
+# Add your proxies here, one per line
+# Supported formats:
+# - http://ip:port
+# - http://username:password@ip:port
+# - https://ip:port
+# - socks5://ip:port
+# - socks5://username:password@ip:port
