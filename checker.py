@@ -25,9 +25,24 @@ class ProxyManager:
         self.proxies = []
         if proxy_file and Path(proxy_file).exists():
             with open(proxy_file, 'r') as f:
-                self.proxies = [line.strip() for line in f if line.strip()]
+                for line in f:
+                    proxy = line.strip()
+                    if proxy:
+                        # Add http:// prefix if not present
+                        if not proxy.startswith('http://') and not proxy.startswith('https://'):
+                            proxy = f'http://{proxy}'
+                        self.proxies.append(proxy)
+            if self.proxies:
+                console.print(f"[green]Loaded {len(self.proxies)} proxies from {proxy_file}[/green]")
         elif proxy_list:
-            self.proxies = proxy_list
+            self.proxies = []
+            for proxy in proxy_list:
+                # Add http:// prefix if not present
+                if not proxy.startswith('http://') and not proxy.startswith('https://'):
+                    proxy = f'http://{proxy}'
+                self.proxies.append(proxy)
+            if self.proxies:
+                console.print(f"[green]Loaded {len(self.proxies)} proxies[/green]")
         self.current_index = 0
 
     def get_next_proxy(self) -> Optional[str]:
@@ -605,7 +620,7 @@ Examples:
     parser.add_argument('-f', '--file', help='File with user IDs (one per line)')
     parser.add_argument('-u', '--users', nargs='+', help='User IDs to check')
     parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent workers (default: 10)')
-    parser.add_argument('-p', '--proxy-file', help='File with proxies (one per line, format: http://ip:port)')
+    parser.add_argument('-p', '--proxy-file', help='File with proxies (one per line, format: ip:port)')
     parser.add_argument('-o', '--output', default='valid_credentials.txt', help='Output file for valid credentials')
     parser.add_argument('-r', '--retries', type=int, default=3, help='Max retries per request (default: 3)')
     parser.add_argument('-t', '--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
