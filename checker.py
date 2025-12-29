@@ -19,31 +19,83 @@ console = Console()
 
 
 class ProxyManager:
-    """Manages proxy rotation and validation"""
+    """Manages proxy rotation and validation with auto-reload"""
 
-    def __init__(self, proxy_file: Optional[str] = None, proxy_list: Optional[List[str]] = None):
+    def __init__(self, proxy_file: Optional[str] = None, proxy_list: Optional[List[str]] = None, proxy_api_url: Optional[str] = None):
         self.proxies = []
-        if proxy_file and Path(proxy_file).exists():
-            with open(proxy_file, 'r') as f:
-                for line in f:
-                    proxy = line.strip()
-                    if proxy:
-                        # Add http:// prefix if not present
-                        if not proxy.startswith('http://') and not proxy.startswith('https://'):
-                            proxy = f'http://{proxy}'
-                        self.proxies.append(proxy)
-            if self.proxies:
-                console.print(f"[green]Loaded {len(self.proxies)} proxies from {proxy_file}[/green]")
-        elif proxy_list:
-            self.proxies = []
-            for proxy in proxy_list:
-                # Add http:// prefix if not present
-                if not proxy.startswith('http://') and not proxy.startswith('https://'):
-                    proxy = f'http://{proxy}'
-                self.proxies.append(proxy)
-            if self.proxies:
-                console.print(f"[green]Loaded {len(self.proxies)} proxies[/green]")
+        self.proxy_file = proxy_file
+        self.proxy_api_url = proxy_api_url
         self.current_index = 0
+        self.request_counter = 0
+        self.reload_interval = 100000  # Reload every 100k requests
+        self.lock = asyncio.Lock()
+
+        # Initial load (sync only)
+        if proxy_file and Path(proxy_file).exists():
+            self._load_proxies_from_file(proxy_file)
+        elif proxy_list:
+            self._load_proxies_from_list(proxy_list)
+
+    async def initialize(self):
+        """Async initialization - load proxies from API if needed"""
+        if self.proxy_api_url:
+            await self._load_proxies_from_api()
+
+    def _load_proxies_from_file(self, proxy_file: str):
+        """Load proxies from file"""
+        self.proxies = []
+        with open(proxy_file, 'r') as f:
+            for line in f:
+                proxy = line.strip()
+                if proxy:
+                    # Add http:// prefix if not present
+                    if not proxy.startswith('http://') and not proxy.startswith('https://'):
+                        proxy = f'http://{proxy}'
+                    self.proxies.append(proxy)
+        if self.proxies:
+            console.print(f"[green]Loaded {len(self.proxies)} proxies from {proxy_file}[/green]")
+
+    def _load_proxies_from_list(self, proxy_list: List[str]):
+        """Load proxies from list"""
+        self.proxies = []
+        for proxy in proxy_list:
+            # Add http:// prefix if not present
+            if not proxy.startswith('http://') and not proxy.startswith('https://'):
+                proxy = f'http://{proxy}'
+            self.proxies.append(proxy)
+        if self.proxies:
+            console.print(f"[green]Loaded {len(self.proxies)} proxies[/green]")
+
+    async def _load_proxies_from_api(self):
+        """Load proxies from API URL"""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.proxy_api_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        self.proxies = []
+                        for line in text.split('\n'):
+                            proxy = line.strip()
+                            if proxy:
+                                # Add http:// prefix if not present
+                                if not proxy.startswith('http://') and not proxy.startswith('https://'):
+                                    proxy = f'http://{proxy}'
+                                self.proxies.append(proxy)
+                        if self.proxies:
+                            console.print(f"[green]Loaded {len(self.proxies)} proxies from API[/green]")
+                    else:
+                        console.print(f"[yellow]⚠ Failed to load proxies from API: HTTP {response.status}[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Error loading proxies from API: {e}[/yellow]")
+
+    async def check_and_reload_proxies(self):
+        """Check if proxies need to be reloaded"""
+        async with self.lock:
+            if self.request_counter >= self.reload_interval and self.proxy_api_url:
+                console.print(f"\n[cyan]Reloading proxies ({self.request_counter:,} requests made)...[/cyan]")
+                await self._load_proxies_from_api()
+                self.request_counter = 0
 
     def get_next_proxy(self) -> Optional[str]:
         """Get next proxy in rotation"""
@@ -51,11 +103,15 @@ class ProxyManager:
             return None
         proxy = self.proxies[self.current_index % len(self.proxies)]
         self.current_index += 1
+        self.request_counter += 1
         return proxy
 
     def get_random_proxy(self) -> Optional[str]:
         """Get random proxy"""
-        return random.choice(self.proxies) if self.proxies else None
+        if not self.proxies:
+            return None
+        self.request_counter += 1
+        return random.choice(self.proxies)
 
 
 class ProgressManager:
@@ -443,6 +499,10 @@ class BruteForcer:
             try:
                 await self.checker.check_credential(user_id)
 
+                # Check and reload proxies if needed
+                if self.checker.proxy_manager:
+                    await self.checker.proxy_manager.check_and_reload_proxies()
+
                 # Update progress with live stats
                 stats = self.checker.stats
                 elapsed = (datetime.now() - stats.start_time).total_seconds()
@@ -610,6 +670,7 @@ async def main():
 Examples:
   %(prog)s -f users.txt -w 20
   %(prog)s -f users.txt -p proxies.txt -w 50
+  %(prog)s -f users.txt --proxy-api "https://api.best-proxies.ru/proxylist.txt?key=YOUR_KEY&type=http&limit=0" -w 100
   %(prog)s -u 01911105338 01922334455
   %(prog)s -f users.txt --proxy-file proxies.txt --output results.txt
   %(prog)s -f huge_file.txt -w 100 --no-count  # Skip line counting for faster startup
@@ -621,6 +682,7 @@ Examples:
     parser.add_argument('-u', '--users', nargs='+', help='User IDs to check')
     parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent workers (default: 10)')
     parser.add_argument('-p', '--proxy-file', help='File with proxies (one per line, format: ip:port)')
+    parser.add_argument('--proxy-api', help='Proxy API URL (auto-reloads every 100k requests)')
     parser.add_argument('-o', '--output', default='valid_credentials.txt', help='Output file for valid credentials')
     parser.add_argument('-r', '--retries', type=int, default=3, help='Max retries per request (default: 3)')
     parser.add_argument('-t', '--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
@@ -656,7 +718,13 @@ Examples:
         sys.exit(1)
 
     # Initialize proxy manager
-    proxy_manager = ProxyManager(proxy_file=args.proxy_file) if args.proxy_file else None
+    proxy_manager = None
+    if args.proxy_api:
+        proxy_manager = ProxyManager(proxy_api_url=args.proxy_api)
+        # Load proxies from API
+        await proxy_manager.initialize()
+    elif args.proxy_file:
+        proxy_manager = ProxyManager(proxy_file=args.proxy_file)
 
     # Initialize results manager
     results_manager = ResultsManager(output_file=args.output)
