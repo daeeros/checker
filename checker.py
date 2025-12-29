@@ -30,6 +30,10 @@ class ProxyManager:
         self.reload_interval = 100000  # Reload every 100k requests
         self.lock = asyncio.Lock()
 
+        # Proxy error tracking
+        self.proxy_errors = {}  # {proxy: consecutive_error_count}
+        self.max_errors = 5  # Remove proxy after 5 consecutive errors
+
         # Initial load (sync only)
         if proxy_file and Path(proxy_file).exists():
             self._load_proxies_from_file(proxy_file)
@@ -112,6 +116,27 @@ class ProxyManager:
             return None
         self.request_counter += 1
         return random.choice(self.proxies)
+
+    async def mark_proxy_error(self, proxy: str):
+        """Mark a proxy as having an error"""
+        async with self.lock:
+            self.proxy_errors[proxy] = self.proxy_errors.get(proxy, 0) + 1
+            if self.proxy_errors[proxy] >= self.max_errors:
+                await self.remove_bad_proxy(proxy)
+
+    async def mark_proxy_success(self, proxy: str):
+        """Reset error count for successful proxy"""
+        async with self.lock:
+            if proxy in self.proxy_errors:
+                self.proxy_errors[proxy] = 0
+
+    async def remove_bad_proxy(self, proxy: str):
+        """Remove proxy after too many errors"""
+        if proxy in self.proxies:
+            self.proxies.remove(proxy)
+            console.print(f"[red]✗ Removed bad proxy: {proxy} (>{self.max_errors} errors)[/red]")
+            if proxy in self.proxy_errors:
+                del self.proxy_errors[proxy]
 
 
 class ProgressManager:
@@ -378,6 +403,10 @@ class Checker:
             # Make request with HTTP proxy - ALLOW REDIRECTS
             async with session.post(self.api_url, data=form, allow_redirects=True, proxy=proxy) as response:
                 if response.status == 200:
+                    # Mark proxy as working
+                    if self.proxy_manager and proxy:
+                        await self.proxy_manager.mark_proxy_success(proxy)
+
                     # Parse the final page
                     html = await response.text()
                     account_info = self.parse_account_info(html)
@@ -419,6 +448,10 @@ class Checker:
                     return False
 
         except Exception as e:
+            # Track proxy error
+            if self.proxy_manager and proxy:
+                await self.proxy_manager.mark_proxy_error(proxy)
+
             # Retry logic
             if retry_count < self.max_retries:
                 await asyncio.sleep(1 * (retry_count + 1))  # Exponential backoff
