@@ -295,21 +295,19 @@ class Checker:
 
     async def parse_hidden_inputs(self, session: aiohttp.ClientSession, proxy: Optional[str] = None) -> Optional[Dict]:
         """Parse hidden inputs from page"""
-        try:
-            async with session.get(self.api_url, proxy=proxy) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'lxml')
-                    hidden_inputs = soup.find_all("input", type="hidden")
-                    inputs = {}
-                    for hidden_input in hidden_inputs:
-                        name = hidden_input.get("name")
-                        value = hidden_input.get("value", "")
-                        inputs[name] = value
-                    return inputs
-        except Exception as e:
-            console.print(f"[yellow]⚠ Error parsing hidden inputs: {e}[/yellow]")
-            return None
+        async with session.get(self.api_url, proxy=proxy) as response:
+            if response.status == 200:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'lxml')
+                hidden_inputs = soup.find_all("input", type="hidden")
+                inputs = {}
+                for hidden_input in hidden_inputs:
+                    name = hidden_input.get("name")
+                    value = hidden_input.get("value", "")
+                    inputs[name] = value
+                return inputs
+            else:
+                raise Exception(f"Failed to get login page: HTTP {response.status}")
 
     def parse_account_info(self, html: str) -> Optional[Dict]:
         """Parse account information from dashboard HTML"""
